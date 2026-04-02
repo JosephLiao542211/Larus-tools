@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: tempo-logger
+    runtime: docker
+    plan: free
+    envVars:
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
+        sync: false
+      - key: MY_PHONE_NUMBER
+        sync: false
+      - key: TEMPO_API_TOKEN
+        sync: false
+      - key: JIRA_ACCOUNT_ID
+        sync: false
+      - key: TICKETS
+        sync: false
+      - key: TEMPO_BASE_URL
+        value: https://api.tempo.io
+      - key: DAILY_HOURS
+        value: "7.5"
+      - key: PROMPT_HOUR
+        value: "9"
