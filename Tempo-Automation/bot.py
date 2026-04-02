@@ -29,8 +29,9 @@ AUTH_PASS = os.environ["AUTH_PASSWORD"]
 
 twilio = Client(TWILIO_SID, TWILIO_AUTH)
 
-# Cache: {year: {"2026-04-03": "Good Friday", ...}}
-_tempo_holidays: dict[int, dict[str, str]] = {}
+# Caches
+_tempo_holidays: dict[int, dict[str, str]] = {}  # {year: {"2026-04-03": "Good Friday"}}
+_workload_days: dict[int, int] | None = None       # {0: 27000, 1: 27000, ..., 5: 0, 6: 0}
 
 
 def require_auth(f):
@@ -56,18 +57,55 @@ def tempo_get(path: str, params: dict = None) -> dict:
     return r.json()
 
 
+def get_workload_scheme() -> dict[int, int]:
+    """Get required seconds per weekday from user's workload scheme.
+    Returns {0: 27000, 1: 27000, ..., 5: 0, 6: 0} (Mon=0, Sun=6)."""
+    global _workload_days
+    if _workload_days is not None:
+        return _workload_days
+
+    try:
+        scheme_data = tempo_get(f"/4/workload-schemes/users/{JIRA_ACCOUNT_ID}")
+        scheme_id = scheme_data["id"]
+        scheme = tempo_get(f"/4/workload-schemes/{scheme_id}")
+        log.info(f"Workload scheme: {scheme}")
+
+        # Tempo days: 1=Mon..7=Sun -> Python weekday: 0=Mon..6=Sun
+        _workload_days = {}
+        for day_info in scheme.get("days", []):
+            tempo_day = day_info["day"]            # 1-7
+            py_weekday = tempo_day - 1             # 0-6
+            _workload_days[py_weekday] = day_info.get("requiredSeconds", 0)
+
+        log.info(f"Workload days: {_workload_days}")
+        return _workload_days
+    except Exception as e:
+        log.error(f"Failed to fetch workload scheme: {e}")
+        # Fallback: Mon-Fri = DAILY_SECONDS, Sat-Sun = 0
+        return {i: (DAILY_SECONDS if i < 5 else 0) for i in range(7)}
+
+
+def get_required_seconds(d: datetime.date) -> int:
+    """Get required seconds for a specific date (considers workload scheme + holidays)."""
+    # Holidays = 0 required
+    holidays = get_tempo_holidays(d.year)
+    if d.isoformat() in holidays:
+        return 0
+    # Otherwise use workload scheme
+    scheme = get_workload_scheme()
+    return scheme.get(d.weekday(), 0)
+
+
 def get_tempo_holidays(year: int) -> dict[str, str]:
     """Fetch holidays from Tempo for a given year. Returns {date_str: name}."""
     if year in _tempo_holidays:
         return _tempo_holidays[year]
 
     try:
-        # Get the user's holiday scheme
         scheme_data = tempo_get(f"/4/holiday-schemes/users/{JIRA_ACCOUNT_ID}")
         scheme_id = scheme_data["id"]
         log.info(f"User holiday scheme: id={scheme_id} name={scheme_data.get('name')}")
 
-        # Get holidays for that scheme and year
         holidays_data = tempo_get(f"/4/holiday-schemes/{scheme_id}/holidays",
                                   {"year": year})
         result = {}
@@ -82,17 +120,18 @@ def get_tempo_holidays(year: int) -> dict[str, str]:
 
 
 def is_workday(d: datetime.date) -> bool:
-    """True if d is a weekday and not a Tempo holiday."""
+    """True if this date requires hours (per workload scheme + holidays)."""
+    return get_required_seconds(d) > 0
+
+
+def get_nonwork_reason(d: datetime.date) -> str:
+    """Return why a day is non-working."""
+    holidays = get_tempo_holidays(d.year)
+    if d.isoformat() in holidays:
+        return holidays[d.isoformat()]
     if d.weekday() >= 5:
-        return False
-    holidays = get_tempo_holidays(d.year)
-    return d.isoformat() not in holidays
-
-
-def get_holiday_name(d: datetime.date) -> str | None:
-    """Return the holiday name if d is a Tempo holiday, else None."""
-    holidays = get_tempo_holidays(d.year)
-    return holidays.get(d.isoformat())
+        return "weekend"
+    return "no required hours"
 
 def sms(body: str):
     twilio.messages.create(body=body, from_=TWILIO_FROM, to=MY_PHONE)
@@ -168,12 +207,17 @@ def workdays(start: datetime.date, count: int) -> list[datetime.date]:
 
 
 def top_up(ticket: dict, date: str, desired: int) -> tuple[str, int]:
-    """Log time but never exceed DAILY_SECONDS. Returns (issue_key, seconds_added).
+    """Log time but never exceed the day's required seconds. Returns (issue_key, seconds_added).
     ticket is {"key": "SGPT-661", "id": "12345"}."""
+    d = datetime.date.fromisoformat(date)
+    required = get_required_seconds(d)
+    if required <= 0:
+        log.info(f"top_up {ticket['key']} {date}: non-working day, skipping")
+        return ticket["key"], 0
     already = get_logged_seconds(date)
-    remaining = DAILY_SECONDS - already
-    log.info(f"top_up {ticket['key']} {date}: already={already}s ({already/3600:.2f}h), "
-             f"remaining={remaining}s ({remaining/3600:.2f}h), desired={desired}s")
+    remaining = required - already
+    log.info(f"top_up {ticket['key']} {date}: required={required}s ({required/3600:.2f}h), "
+             f"already={already}s ({already/3600:.2f}h), remaining={remaining}s ({remaining/3600:.2f}h)")
     if remaining <= 0:
         log.info(f"top_up {ticket['key']} {date}: day is full, skipping")
         return ticket["key"], 0
@@ -190,11 +234,12 @@ def pick(tickets: list[dict], n: int = 1) -> list[dict]:
 # ── Variations ───────────────────────────────────────────────────────────
 
 def variation_1(tickets: list[dict], days: list[datetime.date]) -> list[str]:
-    """One ticket, 7.5h every day all week."""
+    """One ticket, full hours every day all week."""
     t = pick(tickets, 1)[0]
     summary = []
     for d in days:
-        _, added = top_up(t, d.isoformat(), DAILY_SECONDS)
+        req = get_required_seconds(d)
+        _, added = top_up(t, d.isoformat(), req)
         summary.append(f"  {d} {t['key']} +{added/3600:.1f}h")
     return [f"V1: {t['key']} all week"] + summary
 
@@ -205,26 +250,32 @@ def variation_2(tickets: list[dict], days: list[datetime.date]) -> list[str]:
     a, b = ts[0], ts[-1]  # if only 1 ticket, a==b is fine
     summary = [f"V2: {a['key']} x3 days, {b['key']} x2 days"]
     for d in days[:3]:
-        _, added = top_up(a, d.isoformat(), DAILY_SECONDS)
+        req = get_required_seconds(d)
+        _, added = top_up(a, d.isoformat(), req)
         summary.append(f"  {d} {a['key']} +{added/3600:.1f}h")
     for d in days[3:]:
-        _, added = top_up(b, d.isoformat(), DAILY_SECONDS)
+        req = get_required_seconds(d)
+        _, added = top_up(b, d.isoformat(), req)
         summary.append(f"  {d} {b['key']} +{added/3600:.1f}h")
     return summary
 
 
 def variation_3(tickets: list[dict], days: list[datetime.date]) -> list[str]:
-    """Day1: split 2.5+5, Day2: split 2.5+5 (same pair), Day3-5: 7.5 one ticket."""
+    """Day1: split 1/3+2/3, Day2: split 1/3+2/3 (same pair), Day3-5: full hours one ticket."""
     ts = pick(tickets, 2)
     a, b = ts[0], ts[-1]
     c = pick(tickets, 1)[0]
     summary = [f"V3: {a['key']}/{b['key']} split x2 days, {c['key']} x3 days"]
     for d in days[:2]:
-        _, a1 = top_up(a, d.isoformat(), 9000)   # 2.5h
-        _, a2 = top_up(b, d.isoformat(), 18000)  # 5h
+        req = get_required_seconds(d)
+        split_small = req // 3          # ~2.5h of 7.5
+        split_large = req - split_small # ~5h of 7.5
+        _, a1 = top_up(a, d.isoformat(), split_small)
+        _, a2 = top_up(b, d.isoformat(), split_large)
         summary.append(f"  {d} {a['key']} +{a1/3600:.1f}h, {b['key']} +{a2/3600:.1f}h")
     for d in days[2:]:
-        _, added = top_up(c, d.isoformat(), DAILY_SECONDS)
+        req = get_required_seconds(d)
+        _, added = top_up(c, d.isoformat(), req)
         summary.append(f"  {d} {c['key']} +{added/3600:.1f}h")
     return summary
 
@@ -301,7 +352,7 @@ code{background:#f0f0f0;padding:2px 6px;border-radius:3px;font-size:0.9em}
 <tr><td><a href="/health">/health</a></td><td>Ping check</td></tr>
 <tr><td><a href="/test/sms">/test/sms</a></td><td>Send status SMS (active tickets + today's hours)</td></tr>
 <tr><td><a href="/test/topup">/test/topup</a></td><td>Top up today to 7.5h on a random ticket (workdays only)</td></tr>
-<tr><td><a href="/test/holiday">/test/holiday</a></td><td>List all Ontario holidays (red days) for this year</td></tr>
+<tr><td><a href="/test/holiday">/test/holiday</a></td><td>Show workload scheme + Tempo holidays (non-working days)</td></tr>
 <tr><td><a href="/run/weekly">/run/weekly</a></td><td>Fill the week with a random variation (cron: Mon 9am)</td></tr>
 <tr><td><a href="/run/monthend">/run/monthend</a></td><td>Fill month-end gaps (cron: daily 8am, acts 7 days before EOM)</td></tr>
 </table>
@@ -358,7 +409,7 @@ def test_topup():
     try:
         today_date = datetime.datetime.now(TZ).date()
         if not is_workday(today_date):
-            reason = get_holiday_name(today_date) or "weekend"
+            reason = get_nonwork_reason(today_date)
             msg = f"Not a workday ({reason}) — no hours logged."
             sms(msg)
             return msg, 200
@@ -370,16 +421,17 @@ def test_topup():
             return msg, 200
 
         today = datetime.datetime.now(TZ).date().isoformat()
+        required = get_required_seconds(today_date)
         already = get_logged_seconds(today)
-        remaining = DAILY_SECONDS - already
+        remaining = required - already
         t = random.choice(tickets)
 
-        log.info(f"/test/topup: today={today} ticket={t} already={already}s "
-                 f"({already/3600:.2f}h) remaining={remaining}s ({remaining/3600:.2f}h)")
+        log.info(f"/test/topup: today={today} ticket={t} required={required}s "
+                 f"already={already}s remaining={remaining}s")
 
         if remaining <= 0:
             msg = (f"Today already full.\n"
-                   f"Logged: {already/3600:.2f}h / {DAILY_SECONDS/3600:.1f}h\n"
+                   f"Logged: {already/3600:.2f}h / {required/3600:.1f}h\n"
                    f"Nothing added.")
             sms(msg)
             return msg, 200
@@ -388,7 +440,7 @@ def test_topup():
         if ok:
             msg = (f"Topped up today:\n"
                    f"  {today} {t['key']} +{remaining/3600:.2f}h\n"
-                   f"  Was: {already/3600:.2f}h, now: {DAILY_SECONDS/3600:.1f}h")
+                   f"  Was: {already/3600:.2f}h, now: {required/3600:.1f}h")
         else:
             msg = (f"FAILED to log {t['key']} on {today}.\n"
                    f"  Was: {already/3600:.2f}h, tried to add: {remaining/3600:.2f}h\n"
@@ -403,22 +455,35 @@ def test_topup():
 @app.route("/test/holiday")
 @require_auth
 def test_holiday():
-    """List all Tempo holidays (red days) for the current year."""
+    """List all non-working days: Tempo holidays + workload scheme."""
     try:
+        global _workload_days
         today = datetime.datetime.now(TZ).date()
         year = today.year
-        # Clear cache to get fresh data
+
+        # Clear caches for fresh data
         _tempo_holidays.pop(year, None)
-        holidays = get_tempo_holidays(year)
+        _workload_days = None
 
-        if not holidays:
-            return "No holidays found in your Tempo holiday scheme.", 200
+        # Workload scheme
+        scheme = get_workload_scheme()
+        day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        lines = ["Workload scheme (required hours per day):"]
+        for i in range(7):
+            secs = scheme.get(i, 0)
+            lines.append(f"  {day_names[i]}: {secs/3600:.1f}h")
 
-        lines = [f"Tempo holidays {year}:\n"]
-        for date_str in sorted(holidays):
-            d = datetime.date.fromisoformat(date_str)
-            past = " (past)" if d < today else ""
-            lines.append(f"  {date_str} {d.strftime('%a')} - {holidays[date_str]}{past}")
+        # Holidays
+        tempo_holidays = get_tempo_holidays(year)
+        lines.append(f"\nTempo holidays {year}:")
+        if tempo_holidays:
+            for date_str in sorted(tempo_holidays):
+                d = datetime.date.fromisoformat(date_str)
+                past = " (past)" if d < today else ""
+                lines.append(f"  {date_str} {d.strftime('%a')} - {tempo_holidays[date_str]}{past}")
+        else:
+            lines.append("  (none found)")
+
         msg = "\n".join(lines)
         return msg, 200
     except Exception as e:
