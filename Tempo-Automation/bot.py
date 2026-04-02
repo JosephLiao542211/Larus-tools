@@ -30,7 +30,7 @@ AUTH_PASS = os.environ["AUTH_PASSWORD"]
 
 twilio = Client(TWILIO_SID, TWILIO_AUTH)
 ca_holidays = holidays.Canada(prov="ON")  # statutory — blocks logging
-ca_optional = holidays.Canada(prov="ON", categories=("optional", "bank"))  # warnings only
+ca_optional = holidays.Canada(prov="ON", categories=("optional",))  # warnings only
 
 
 def require_auth(f):
