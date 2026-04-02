@@ -1,5 +1,4 @@
 import os, logging, random, datetime, calendar, requests, zoneinfo, functools
-import holidays
 from flask import Flask, request as flask_request, Response
 from twilio.rest import Client
 
@@ -29,7 +28,9 @@ AUTH_USER = os.environ["AUTH_USERNAME"]
 AUTH_PASS = os.environ["AUTH_PASSWORD"]
 
 twilio = Client(TWILIO_SID, TWILIO_AUTH)
-ca_holidays = holidays.Canada(prov="ON")
+
+# Cache: {year: {"2026-04-03": "Good Friday", ...}}
+_tempo_holidays: dict[int, dict[str, str]] = {}
 
 
 def require_auth(f):
@@ -45,9 +46,53 @@ def require_auth(f):
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
+def tempo_get(path: str, params: dict = None) -> dict:
+    """Authenticated GET to Tempo API."""
+    r = requests.get(f"{TEMPO_BASE}{path}",
+                     headers={"Authorization": f"Bearer {TEMPO_TOKEN}"},
+                     params=params)
+    log.info(f"GET {TEMPO_BASE}{path} params={params} -> {r.status_code}")
+    r.raise_for_status()
+    return r.json()
+
+
+def get_tempo_holidays(year: int) -> dict[str, str]:
+    """Fetch holidays from Tempo for a given year. Returns {date_str: name}."""
+    if year in _tempo_holidays:
+        return _tempo_holidays[year]
+
+    try:
+        # Get the user's holiday scheme
+        scheme_data = tempo_get(f"/4/holiday-schemes/users/{JIRA_ACCOUNT_ID}")
+        scheme_id = scheme_data["id"]
+        log.info(f"User holiday scheme: id={scheme_id} name={scheme_data.get('name')}")
+
+        # Get holidays for that scheme and year
+        holidays_data = tempo_get(f"/4/holiday-schemes/{scheme_id}/holidays",
+                                  {"year": year})
+        result = {}
+        for h in holidays_data.get("results", []):
+            result[h["date"]] = h.get("name", "Holiday")
+        _tempo_holidays[year] = result
+        log.info(f"Tempo holidays for {year}: {result}")
+        return result
+    except Exception as e:
+        log.error(f"Failed to fetch Tempo holidays: {e}")
+        return {}
+
+
 def is_workday(d: datetime.date) -> bool:
-    """True if d is a weekday and not a Canadian/Ontario holiday."""
-    return d.weekday() < 5 and d not in ca_holidays
+    """True if d is a weekday and not a Tempo holiday."""
+    if d.weekday() >= 5:
+        return False
+    holidays = get_tempo_holidays(d.year)
+    return d.isoformat() not in holidays
+
+
+def get_holiday_name(d: datetime.date) -> str | None:
+    """Return the holiday name if d is a Tempo holiday, else None."""
+    holidays = get_tempo_holidays(d.year)
+    return holidays.get(d.isoformat())
 
 def sms(body: str):
     twilio.messages.create(body=body, from_=TWILIO_FROM, to=MY_PHONE)
@@ -313,7 +358,7 @@ def test_topup():
     try:
         today_date = datetime.datetime.now(TZ).date()
         if not is_workday(today_date):
-            reason = ca_holidays.get(today_date, "weekend")
+            reason = get_holiday_name(today_date) or "weekend"
             msg = f"Not a workday ({reason}) — no hours logged."
             sms(msg)
             return msg, 200
@@ -358,15 +403,22 @@ def test_topup():
 @app.route("/test/holiday")
 @require_auth
 def test_holiday():
-    """List all holidays (red days) for the current year."""
+    """List all Tempo holidays (red days) for the current year."""
     try:
         today = datetime.datetime.now(TZ).date()
         year = today.year
-        year_holidays = sorted(ca_holidays[datetime.date(year, 1, 1):datetime.date(year, 12, 31)])
-        lines = [f"Ontario holidays {year}:\n"]
-        for d in year_holidays:
+        # Clear cache to get fresh data
+        _tempo_holidays.pop(year, None)
+        holidays = get_tempo_holidays(year)
+
+        if not holidays:
+            return "No holidays found in your Tempo holiday scheme.", 200
+
+        lines = [f"Tempo holidays {year}:\n"]
+        for date_str in sorted(holidays):
+            d = datetime.date.fromisoformat(date_str)
             past = " (past)" if d < today else ""
-            lines.append(f"  {d} {d.strftime('%a')} - {ca_holidays.get(d)}{past}")
+            lines.append(f"  {date_str} {d.strftime('%a')} - {holidays[date_str]}{past}")
         msg = "\n".join(lines)
         return msg, 200
     except Exception as e:
