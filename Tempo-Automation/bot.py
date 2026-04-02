@@ -1,4 +1,5 @@
 import os, logging, random, datetime, calendar, requests, zoneinfo, functools
+import holidays
 from flask import Flask, request as flask_request, Response
 from twilio.rest import Client
 
@@ -28,10 +29,8 @@ AUTH_USER = os.environ["AUTH_USERNAME"]
 AUTH_PASS = os.environ["AUTH_PASSWORD"]
 
 twilio = Client(TWILIO_SID, TWILIO_AUTH)
-
-# Caches
-_tempo_holidays: dict[int, dict[str, str]] = {}  # {year: {"2026-04-03": "Good Friday"}}
-_workload_days: dict[int, int] | None = None       # {0: 27000, 1: 27000, ..., 5: 0, 6: 0}
+ca_holidays = holidays.Canada(prov="ON")  # statutory — blocks logging
+ca_optional = holidays.Canada(prov="ON", categories=("optional", "bank"))  # warnings only
 
 
 def require_auth(f):
@@ -47,91 +46,24 @@ def require_auth(f):
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
-def tempo_get(path: str, params: dict = None) -> dict:
-    """Authenticated GET to Tempo API."""
-    r = requests.get(f"{TEMPO_BASE}{path}",
-                     headers={"Authorization": f"Bearer {TEMPO_TOKEN}"},
-                     params=params)
-    log.info(f"GET {TEMPO_BASE}{path} params={params} -> {r.status_code}")
-    r.raise_for_status()
-    return r.json()
-
-
-def get_workload_scheme() -> dict[int, int]:
-    """Get required seconds per weekday from user's workload scheme.
-    Returns {0: 27000, 1: 27000, ..., 5: 0, 6: 0} (Mon=0, Sun=6)."""
-    global _workload_days
-    if _workload_days is not None:
-        return _workload_days
-
-    try:
-        scheme_data = tempo_get(f"/4/workload-schemes/users/{JIRA_ACCOUNT_ID}")
-        scheme_id = scheme_data["id"]
-        scheme = tempo_get(f"/4/workload-schemes/{scheme_id}")
-        log.info(f"Workload scheme: {scheme}")
-
-        # Tempo days: 1=Mon..7=Sun -> Python weekday: 0=Mon..6=Sun
-        _workload_days = {}
-        for day_info in scheme.get("days", []):
-            tempo_day = day_info["day"]            # 1-7
-            py_weekday = tempo_day - 1             # 0-6
-            _workload_days[py_weekday] = day_info.get("requiredSeconds", 0)
-
-        log.info(f"Workload days: {_workload_days}")
-        return _workload_days
-    except Exception as e:
-        log.error(f"Failed to fetch workload scheme: {e}")
-        # Fallback: Mon-Fri = DAILY_SECONDS, Sat-Sun = 0
-        return {i: (DAILY_SECONDS if i < 5 else 0) for i in range(7)}
+def is_workday(d: datetime.date) -> bool:
+    """True if weekday and not a statutory or optional holiday."""
+    return d.weekday() < 5 and d not in ca_holidays and d not in ca_optional
 
 
 def get_required_seconds(d: datetime.date) -> int:
-    """Get required seconds for a specific date (considers workload scheme + holidays)."""
-    # Holidays = 0 required
-    holidays = get_tempo_holidays(d.year)
-    if d.isoformat() in holidays:
-        return 0
-    # Otherwise use workload scheme
-    scheme = get_workload_scheme()
-    return scheme.get(d.weekday(), 0)
-
-
-def get_tempo_holidays(year: int) -> dict[str, str]:
-    """Fetch holidays from Tempo for a given year. Returns {date_str: name}."""
-    if year in _tempo_holidays:
-        return _tempo_holidays[year]
-
-    try:
-        scheme_data = tempo_get(f"/4/holiday-schemes/users/{JIRA_ACCOUNT_ID}")
-        scheme_id = scheme_data["id"]
-        log.info(f"User holiday scheme: id={scheme_id} name={scheme_data.get('name')}")
-
-        holidays_data = tempo_get(f"/4/holiday-schemes/{scheme_id}/holidays",
-                                  {"year": year})
-        result = {}
-        for h in holidays_data.get("results", []):
-            result[h["date"]] = h.get("name", "Holiday")
-        _tempo_holidays[year] = result
-        log.info(f"Tempo holidays for {year}: {result}")
-        return result
-    except Exception as e:
-        log.error(f"Failed to fetch Tempo holidays: {e}")
-        return {}
-
-
-def is_workday(d: datetime.date) -> bool:
-    """True if this date requires hours (per workload scheme + holidays)."""
-    return get_required_seconds(d) > 0
+    """Required seconds for a date. 0 for weekends/holidays."""
+    return DAILY_SECONDS if is_workday(d) else 0
 
 
 def get_nonwork_reason(d: datetime.date) -> str:
-    """Return why a day is non-working."""
-    holidays = get_tempo_holidays(d.year)
-    if d.isoformat() in holidays:
-        return holidays[d.isoformat()]
+    if d in ca_holidays:
+        return ca_holidays.get(d)
+    if d in ca_optional:
+        return ca_optional.get(d)
     if d.weekday() >= 5:
         return "weekend"
-    return "no required hours"
+    return "non-working day"
 
 def sms(body: str):
     twilio.messages.create(body=body, from_=TWILIO_FROM, to=MY_PHONE)
@@ -292,10 +224,23 @@ def monday_job():
     today = datetime.datetime.now(TZ).date()
     days = workdays(today, 5)  # Mon-Fri
 
+    # Check for optional holidays this week (skipped but noted)
+    week_start = today
+    week_end = today + datetime.timedelta(days=4)
+    skipped = []
+    d = week_start
+    while d <= week_end:
+        if d.weekday() < 5 and d in ca_optional:
+            skipped.append(f"  {d} {d.strftime('%a')} - {ca_optional.get(d)}")
+        d += datetime.timedelta(days=1)
+
     variation = random.choice([variation_1, variation_2, variation_3])
     lines = variation(tickets, days)
 
-    sms("Weekly timesheet filled!\n" + "\n".join(lines))
+    msg = "Weekly timesheet filled!\n" + "\n".join(lines)
+    if skipped:
+        msg += "\n\nFYI - skipped optional holidays:\n" + "\n".join(skipped)
+    sms(msg)
 
 
 def month_end_job():
@@ -352,7 +297,7 @@ code{background:#f0f0f0;padding:2px 6px;border-radius:3px;font-size:0.9em}
 <tr><td><a href="/health">/health</a></td><td>Ping check</td></tr>
 <tr><td><a href="/test/sms">/test/sms</a></td><td>Send status SMS (active tickets + today's hours)</td></tr>
 <tr><td><a href="/test/topup">/test/topup</a></td><td>Top up today to 7.5h on a random ticket (workdays only)</td></tr>
-<tr><td><a href="/test/holiday">/test/holiday</a></td><td>Show workload scheme + Tempo holidays (non-working days)</td></tr>
+<tr><td><a href="/test/holiday">/test/holiday</a></td><td>List Ontario statutory holidays for this year</td></tr>
 <tr><td><a href="/run/weekly">/run/weekly</a></td><td>Fill the week with a random variation (cron: Mon 9am)</td></tr>
 <tr><td><a href="/run/monthend">/run/monthend</a></td><td>Fill month-end gaps (cron: daily 8am, acts 7 days before EOM)</td></tr>
 </table>
@@ -455,34 +400,22 @@ def test_topup():
 @app.route("/test/holiday")
 @require_auth
 def test_holiday():
-    """List all non-working days: Tempo holidays + workload scheme."""
+    """List all Ontario holidays for the current year."""
     try:
-        global _workload_days
         today = datetime.datetime.now(TZ).date()
         year = today.year
 
-        # Clear caches for fresh data
-        _tempo_holidays.pop(year, None)
-        _workload_days = None
+        stat = sorted(ca_holidays[datetime.date(year, 1, 1):datetime.date(year, 12, 31)])
+        lines = [f"STATUTORY (no logging) {year}:"]
+        for d in stat:
+            past = " (past)" if d < today else ""
+            lines.append(f"  {d} {d.strftime('%a')} - {ca_holidays.get(d)}{past}")
 
-        # Workload scheme
-        scheme = get_workload_scheme()
-        day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-        lines = ["Workload scheme (required hours per day):"]
-        for i in range(7):
-            secs = scheme.get(i, 0)
-            lines.append(f"  {day_names[i]}: {secs/3600:.1f}h")
-
-        # Holidays
-        tempo_holidays = get_tempo_holidays(year)
-        lines.append(f"\nTempo holidays {year}:")
-        if tempo_holidays:
-            for date_str in sorted(tempo_holidays):
-                d = datetime.date.fromisoformat(date_str)
-                past = " (past)" if d < today else ""
-                lines.append(f"  {date_str} {d.strftime('%a')} - {tempo_holidays[date_str]}{past}")
-        else:
-            lines.append("  (none found)")
+        opt = sorted(ca_optional[datetime.date(year, 1, 1):datetime.date(year, 12, 31)])
+        lines.append(f"\nOPTIONAL/BANK (warning only) {year}:")
+        for d in opt:
+            past = " (past)" if d < today else ""
+            lines.append(f"  {d} {d.strftime('%a')} - {ca_optional.get(d)}{past}")
 
         msg = "\n".join(lines)
         return msg, 200

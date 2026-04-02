@@ -2,3 +2,4 @@ flask==3.1.0
 twilio==9.4.0
 requests==2.32.3
 gunicorn==23.0.0
+holidays==0.46
