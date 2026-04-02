@@ -1,7 +1,6 @@
 import os, logging, random, datetime, calendar, requests
 from flask import Flask
 from twilio.rest import Client
-from apscheduler.schedulers.background import BackgroundScheduler
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
