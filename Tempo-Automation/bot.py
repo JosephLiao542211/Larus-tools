@@ -1,4 +1,4 @@
-import os, logging, random, datetime, calendar, requests
+import os, logging, random, datetime, calendar, requests, zoneinfo
 from flask import Flask
 from twilio.rest import Client
 
@@ -22,6 +22,7 @@ JIRA_DOMAIN = os.environ["JIRA_DOMAIN"]
 JIRA_EMAIL = os.environ["JIRA_EMAIL"]
 JIRA_API_TOKEN = os.environ["JIRA_API_TOKEN"]
 JIRA_BOARD_ID = os.environ["JIRA_BOARD_ID"]
+TZ = zoneinfo.ZoneInfo(os.environ.get("TZ", "America/Toronto"))
 
 twilio = Client(TWILIO_SID, TWILIO_AUTH)
 
@@ -40,8 +41,9 @@ def jira_get(path: str, params: dict = None) -> dict:
     return r.json()
 
 
-def get_active_tickets() -> list[str]:
-    """Get issue keys assigned to you in active sprint (In Progress / In Review)."""
+def get_active_tickets() -> list[dict]:
+    """Get issues assigned to you in active sprint (In Progress / In Review).
+    Returns list of {"key": "SGPT-661", "id": "12345"} dicts."""
     sprints = jira_get(f"/rest/agile/1.0/board/{JIRA_BOARD_ID}/sprint",
                        {"state": "active"})
     active = sprints.get("values", [])
@@ -52,7 +54,9 @@ def get_active_tickets() -> list[str]:
            f'AND status in ("In Progress","In Review")')
     data = jira_get(f"/rest/agile/1.0/sprint/{sid}/issue",
                     {"jql": jql, "fields": "key"})
-    return [i["key"] for i in data.get("issues", [])]
+    tickets = [{"key": i["key"], "id": i["id"]} for i in data.get("issues", [])]
+    log.info(f"Active tickets: {tickets}")
+    return tickets
 
 
 def get_logged_seconds(date: str) -> int:
@@ -71,9 +75,9 @@ def get_logged_seconds(date: str) -> int:
     return total
 
 
-def log_worklog(issue_key: str, date: str, seconds: int) -> bool:
+def log_worklog(issue_id: str, issue_key: str, date: str, seconds: int) -> bool:
     url = f"{TEMPO_BASE}/4/worklogs"
-    payload = {"issueKey": issue_key, "timeSpentSeconds": seconds,
+    payload = {"issueId": int(issue_id), "timeSpentSeconds": seconds,
                "startDate": date, "startTime": "09:00:00",
                "description": f"Work on {issue_key}",
                "authorAccountId": JIRA_ACCOUNT_ID}
@@ -83,7 +87,7 @@ def log_worklog(issue_key: str, date: str, seconds: int) -> bool:
     log.info(f"POST worklog response: {r.status_code} body={r.text[:500]}")
     ok = r.status_code in (200, 201)
     if not ok:
-        log.error(f"POST worklog FAILED {issue_key} {date}: {r.status_code} {r.text}")
+        log.error(f"POST worklog FAILED {issue_key}(id={issue_id}) {date}: {r.status_code} {r.text}")
     return ok
 
 
@@ -98,64 +102,65 @@ def weekdays(start: datetime.date, count: int) -> list[datetime.date]:
     return days
 
 
-def top_up(issue_key: str, date: str, desired: int) -> tuple[str, int]:
-    """Log time but never exceed DAILY_SECONDS. Returns (issue_key, seconds_added)."""
+def top_up(ticket: dict, date: str, desired: int) -> tuple[str, int]:
+    """Log time but never exceed DAILY_SECONDS. Returns (issue_key, seconds_added).
+    ticket is {"key": "SGPT-661", "id": "12345"}."""
     already = get_logged_seconds(date)
     remaining = DAILY_SECONDS - already
-    log.info(f"top_up {issue_key} {date}: already={already}s ({already/3600:.2f}h), "
+    log.info(f"top_up {ticket['key']} {date}: already={already}s ({already/3600:.2f}h), "
              f"remaining={remaining}s ({remaining/3600:.2f}h), desired={desired}s")
     if remaining <= 0:
-        log.info(f"top_up {issue_key} {date}: day is full, skipping")
-        return issue_key, 0
+        log.info(f"top_up {ticket['key']} {date}: day is full, skipping")
+        return ticket["key"], 0
     to_log = min(desired, remaining)
-    ok = log_worklog(issue_key, date, to_log)
-    return issue_key, to_log if ok else 0
+    ok = log_worklog(ticket["id"], ticket["key"], date, to_log)
+    return ticket["key"], to_log if ok else 0
 
 
-def pick(tickets: list[str], n: int = 1) -> list[str]:
+def pick(tickets: list[dict], n: int = 1) -> list[dict]:
     """Pick n random unique tickets."""
     return random.sample(tickets, min(n, len(tickets)))
 
 
 # ── Variations ───────────────────────────────────────────────────────────
 
-def variation_1(tickets: list[str], days: list[datetime.date]) -> list[str]:
+def variation_1(tickets: list[dict], days: list[datetime.date]) -> list[str]:
     """One ticket, 7.5h every day all week."""
     t = pick(tickets, 1)[0]
     summary = []
     for d in days:
         _, added = top_up(t, d.isoformat(), DAILY_SECONDS)
-        summary.append(f"  {d} {t} +{added/3600:.1f}h")
-    return [f"V1: {t} all week"] + summary
+        summary.append(f"  {d} {t['key']} +{added/3600:.1f}h")
+    return [f"V1: {t['key']} all week"] + summary
 
 
-def variation_2(tickets: list[str], days: list[datetime.date]) -> list[str]:
+def variation_2(tickets: list[dict], days: list[datetime.date]) -> list[str]:
     """Ticket A for 3 days, ticket B for 2 days."""
     ts = pick(tickets, 2)
     a, b = ts[0], ts[-1]  # if only 1 ticket, a==b is fine
-    summary = [f"V2: {a} x3 days, {b} x2 days"]
+    summary = [f"V2: {a['key']} x3 days, {b['key']} x2 days"]
     for d in days[:3]:
         _, added = top_up(a, d.isoformat(), DAILY_SECONDS)
-        summary.append(f"  {d} {a} +{added/3600:.1f}h")
+        summary.append(f"  {d} {a['key']} +{added/3600:.1f}h")
     for d in days[3:]:
         _, added = top_up(b, d.isoformat(), DAILY_SECONDS)
-        summary.append(f"  {d} {b} +{added/3600:.1f}h")
+        summary.append(f"  {d} {b['key']} +{added/3600:.1f}h")
     return summary
 
 
-def variation_3(tickets: list[str], days: list[datetime.date]) -> list[str]:
+def variation_3(tickets: list[dict], days: list[datetime.date]) -> list[str]:
     """Day1: split 2.5+5, Day2: split 2.5+5 (same pair), Day3-5: 7.5 one ticket."""
     ts = pick(tickets, 2)
     a, b = ts[0], ts[-1]
     c = pick(tickets, 1)[0]
-    summary = [f"V3: {a}/{b} split x2 days, {c} x3 days"]
+    summary = [f"V3: {a['key']}/{b['key']} split x2 days, {c['key']} x3 days"]
     for d in days[:2]:
         _, a1 = top_up(a, d.isoformat(), 9000)   # 2.5h
         _, a2 = top_up(b, d.isoformat(), 18000)  # 5h
-        summary.append(f"  {d} {a} +{a1/3600:.1f}h, {b} +{a2/3600:.1f}h")
+        summary.append(f"  {d} {a['key']} +{a1/3600:.1f}h, {b['key']} +{a2/3600:.1f}h")
     for d in days[2:]:
         _, added = top_up(c, d.isoformat(), DAILY_SECONDS)
-        summary.append(f"  {d} {c} +{added/3600:.1f}h")
+        summary.append(f"  {d} {c['key']} +{added/3600:.1f}h")
     return summary
 
 
@@ -168,7 +173,7 @@ def monday_job():
         sms("No active tickets found in sprint — nothing logged.")
         return
 
-    today = datetime.date.today()
+    today = datetime.datetime.now(TZ).date()
     days = weekdays(today, 5)  # Mon-Fri
 
     variation = random.choice([variation_1, variation_2, variation_3])
@@ -179,7 +184,7 @@ def monday_job():
 
 def month_end_job():
     """Runs daily; if exactly 7 days before end of month, fill remaining gaps."""
-    today = datetime.date.today()
+    today = datetime.datetime.now(TZ).date()
     last_day = calendar.monthrange(today.year, today.month)[1]
     days_left = last_day - today.day
 
@@ -202,7 +207,7 @@ def month_end_job():
                 t = random.choice(tickets)
                 _, added = top_up(t, d.isoformat(), DAILY_SECONDS)
                 if added > 0:
-                    lines.append(f"  {d} {t} +{added/3600:.1f}h")
+                    lines.append(f"  {d} {t['key']} +{added/3600:.1f}h")
         d += datetime.timedelta(days=1)
 
     if len(lines) == 1:
@@ -246,7 +251,8 @@ def test_sms():
     """Health check that sends you an SMS with debug info."""
     try:
         tickets = get_active_tickets()
-        today = datetime.date.today().isoformat()
+        ticket_keys = [t["key"] for t in tickets]
+        today = datetime.datetime.now(TZ).date().isoformat()
 
         # Fetch worklogs with full debug
         url = f"{TEMPO_BASE}/4/worklogs"
@@ -261,7 +267,7 @@ def test_sms():
                        for w in results]
             entry_text = "\n".join(entries) if entries else "  (none)"
             msg = (f"Tempo bot alive!\n"
-                   f"Active tickets: {len(tickets)} ({', '.join(tickets[:5]) or 'none'})\n"
+                   f"Active tickets: {len(tickets)} ({', '.join(ticket_keys[:5]) or 'none'})\n"
                    f"Today ({today}): {total/3600:.2f}h / {DAILY_SECONDS/3600:.1f}h\n"
                    f"Entries:\n{entry_text}")
         else:
@@ -281,7 +287,7 @@ def test_sms():
 def test_topup():
     """Top up today to 7.5h on a random active ticket (weekdays only)."""
     try:
-        if datetime.date.today().weekday() >= 5:
+        if datetime.datetime.now(TZ).date().weekday() >= 5:
             msg = "It's the weekend — no hours logged."
             sms(msg)
             return msg, 200
@@ -292,7 +298,7 @@ def test_topup():
             sms(msg)
             return msg, 200
 
-        today = datetime.date.today().isoformat()
+        today = datetime.datetime.now(TZ).date().isoformat()
         already = get_logged_seconds(today)
         remaining = DAILY_SECONDS - already
         t = random.choice(tickets)
@@ -307,13 +313,13 @@ def test_topup():
             sms(msg)
             return msg, 200
 
-        ok = log_worklog(t, today, remaining)
+        ok = log_worklog(t["id"], t["key"], today, remaining)
         if ok:
             msg = (f"Topped up today:\n"
-                   f"  {today} {t} +{remaining/3600:.2f}h\n"
+                   f"  {today} {t['key']} +{remaining/3600:.2f}h\n"
                    f"  Was: {already/3600:.2f}h, now: {DAILY_SECONDS/3600:.1f}h")
         else:
-            msg = (f"FAILED to log {t} on {today}.\n"
+            msg = (f"FAILED to log {t['key']} on {today}.\n"
                    f"  Was: {already/3600:.2f}h, tried to add: {remaining/3600:.2f}h\n"
                    f"  Check Render logs for details.")
         sms(msg)
