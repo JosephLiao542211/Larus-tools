@@ -1,6 +1,6 @@
-import os, logging, random, datetime, calendar, requests, zoneinfo
+import os, logging, random, datetime, calendar, requests, zoneinfo, functools
 import holidays
-from flask import Flask
+from flask import Flask, request as flask_request, Response
 from twilio.rest import Client
 
 logging.basicConfig(level=logging.INFO)
@@ -25,8 +25,22 @@ JIRA_API_TOKEN = os.environ["JIRA_API_TOKEN"]
 JIRA_BOARD_ID = os.environ["JIRA_BOARD_ID"]
 TZ = zoneinfo.ZoneInfo(os.environ.get("TZ", "America/Toronto"))
 
+AUTH_USER = os.environ["AUTH_USERNAME"]
+AUTH_PASS = os.environ["AUTH_PASSWORD"]
+
 twilio = Client(TWILIO_SID, TWILIO_AUTH)
 ca_holidays = holidays.Canada(prov="ON")
+
+
+def require_auth(f):
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        auth = flask_request.authorization
+        if not auth or auth.username != AUTH_USER or auth.password != AUTH_PASS:
+            return Response("Unauthorized", 401,
+                            {"WWW-Authenticate": 'Basic realm="Login Required"'})
+        return f(*args, **kwargs)
+    return decorated
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -223,6 +237,7 @@ def month_end_job():
 
 
 @app.route("/")
+@require_auth
 def index():
     return """<html><head><title>Larus Tools</title>
 <style>
@@ -254,6 +269,7 @@ def health():
 
 
 @app.route("/test/sms")
+@require_auth
 def test_sms():
     """Health check that sends you an SMS with debug info."""
     try:
@@ -291,6 +307,7 @@ def test_sms():
 
 
 @app.route("/test/topup")
+@require_auth
 def test_topup():
     """Top up today to 7.5h on a random active ticket (weekdays only)."""
     try:
@@ -339,6 +356,7 @@ def test_topup():
 
 
 @app.route("/test/holiday")
+@require_auth
 def test_holiday():
     """List all holidays (red days) for the current year."""
     try:
@@ -357,6 +375,7 @@ def test_holiday():
 
 
 @app.route("/run/weekly")
+@require_auth
 def run_weekly():
     """Trigger the Monday weekly job on demand."""
     try:
@@ -368,6 +387,7 @@ def run_weekly():
 
 
 @app.route("/run/monthend")
+@require_auth
 def run_monthend():
     """Trigger the month-end gap fill on demand."""
     try:
