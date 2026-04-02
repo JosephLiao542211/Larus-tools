@@ -57,30 +57,33 @@ def get_active_tickets() -> list[str]:
 
 def get_logged_seconds(date: str) -> int:
     """Get total seconds already logged for a date."""
-    r = requests.get(
-        f"{TEMPO_BASE}/4/worklogs",
-        headers={"Authorization": f"Bearer {TEMPO_TOKEN}"},
-        params={"from": date, "to": date, "authorAccountId": JIRA_ACCOUNT_ID,
-                "limit": 1000},
-    )
+    url = f"{TEMPO_BASE}/4/worklogs"
+    params = {"from": date, "to": date, "authorAccountId": JIRA_ACCOUNT_ID, "limit": 1000}
+    log.info(f"GET {url} params={params}")
+    r = requests.get(url, headers={"Authorization": f"Bearer {TEMPO_TOKEN}"}, params=params)
+    log.info(f"GET worklogs response: {r.status_code} body={r.text[:500]}")
     if r.status_code != 200:
+        log.error(f"GET worklogs FAILED: {r.status_code} {r.text}")
         return 0
-    return sum(w["timeSpentSeconds"] for w in r.json().get("results", []))
+    results = r.json().get("results", [])
+    total = sum(w.get("timeSpentSeconds", 0) for w in results)
+    log.info(f"Worklogs for {date}: {len(results)} entries, total={total}s ({total/3600:.2f}h)")
+    return total
 
 
 def log_worklog(issue_key: str, date: str, seconds: int) -> bool:
-    r = requests.post(
-        f"{TEMPO_BASE}/4/worklogs",
-        headers={"Authorization": f"Bearer {TEMPO_TOKEN}",
-                 "Content-Type": "application/json"},
-        json={"issueKey": issue_key, "timeSpentSeconds": seconds,
-              "startDate": date, "startTime": "09:00:00",
-              "description": f"Work on {issue_key}",
-              "authorAccountId": JIRA_ACCOUNT_ID},
-    )
+    url = f"{TEMPO_BASE}/4/worklogs"
+    payload = {"issueKey": issue_key, "timeSpentSeconds": seconds,
+               "startDate": date, "startTime": "09:00:00",
+               "description": f"Work on {issue_key}",
+               "authorAccountId": JIRA_ACCOUNT_ID}
+    log.info(f"POST {url} payload={payload}")
+    r = requests.post(url, headers={"Authorization": f"Bearer {TEMPO_TOKEN}",
+                                     "Content-Type": "application/json"}, json=payload)
+    log.info(f"POST worklog response: {r.status_code} body={r.text[:500]}")
     ok = r.status_code in (200, 201)
     if not ok:
-        log.error(f"FAIL {issue_key} {date}: {r.status_code} {r.text}")
+        log.error(f"POST worklog FAILED {issue_key} {date}: {r.status_code} {r.text}")
     return ok
 
 
@@ -99,7 +102,10 @@ def top_up(issue_key: str, date: str, desired: int) -> tuple[str, int]:
     """Log time but never exceed DAILY_SECONDS. Returns (issue_key, seconds_added)."""
     already = get_logged_seconds(date)
     remaining = DAILY_SECONDS - already
+    log.info(f"top_up {issue_key} {date}: already={already}s ({already/3600:.2f}h), "
+             f"remaining={remaining}s ({remaining/3600:.2f}h), desired={desired}s")
     if remaining <= 0:
+        log.info(f"top_up {issue_key} {date}: day is full, skipping")
         return issue_key, 0
     to_log = min(desired, remaining)
     ok = log_worklog(issue_key, date, to_log)
@@ -237,17 +243,37 @@ def health():
 
 @app.route("/test/sms")
 def test_sms():
-    """Health check that sends you an SMS."""
+    """Health check that sends you an SMS with debug info."""
     try:
         tickets = get_active_tickets()
         today = datetime.date.today().isoformat()
-        logged = get_logged_seconds(today)
-        sms(f"Tempo bot alive!\n"
-            f"Active tickets: {len(tickets)} ({', '.join(tickets[:5]) or 'none'})\n"
-            f"Today ({today}): {logged/3600:.1f}h / {DAILY_SECONDS/3600:.1f}h logged")
-        return "SMS sent", 200
+
+        # Fetch worklogs with full debug
+        url = f"{TEMPO_BASE}/4/worklogs"
+        params = {"from": today, "to": today, "authorAccountId": JIRA_ACCOUNT_ID, "limit": 1000}
+        r = requests.get(url, headers={"Authorization": f"Bearer {TEMPO_TOKEN}"}, params=params)
+        log.info(f"/test/sms GET {url} params={params} -> {r.status_code} body={r.text[:500]}")
+
+        if r.status_code == 200:
+            results = r.json().get("results", [])
+            total = sum(w.get("timeSpentSeconds", 0) for w in results)
+            entries = [f"  {w.get('issue',{}).get('key','?')}: {w.get('timeSpentSeconds',0)/3600:.2f}h"
+                       for w in results]
+            entry_text = "\n".join(entries) if entries else "  (none)"
+            msg = (f"Tempo bot alive!\n"
+                   f"Active tickets: {len(tickets)} ({', '.join(tickets[:5]) or 'none'})\n"
+                   f"Today ({today}): {total/3600:.2f}h / {DAILY_SECONDS/3600:.1f}h\n"
+                   f"Entries:\n{entry_text}")
+        else:
+            msg = (f"Tempo bot alive but GET worklogs failed!\n"
+                   f"Status: {r.status_code}\n"
+                   f"Response: {r.text[:200]}\n"
+                   f"Active tickets: {len(tickets)}")
+
+        sms(msg)
+        return msg, 200
     except Exception as e:
-        log.error(f"test/sms failed: {e}")
+        log.exception(f"test/sms failed: {e}")
         return f"Error: {e}", 500
 
 
@@ -262,21 +288,38 @@ def test_topup():
 
         tickets = get_active_tickets()
         if not tickets:
-            sms("Top-up failed: no active tickets in sprint.")
-            return "No active tickets", 200
+            msg = "Top-up failed: no active tickets in sprint."
+            sms(msg)
+            return msg, 200
 
         today = datetime.date.today().isoformat()
+        already = get_logged_seconds(today)
+        remaining = DAILY_SECONDS - already
         t = random.choice(tickets)
-        _, added = top_up(t, today, DAILY_SECONDS)
 
-        if added > 0:
-            msg = f"Topped up today:\n  {today} {t} +{added/3600:.1f}h"
+        log.info(f"/test/topup: today={today} ticket={t} already={already}s "
+                 f"({already/3600:.2f}h) remaining={remaining}s ({remaining/3600:.2f}h)")
+
+        if remaining <= 0:
+            msg = (f"Today already full.\n"
+                   f"Logged: {already/3600:.2f}h / {DAILY_SECONDS/3600:.1f}h\n"
+                   f"Nothing added.")
+            sms(msg)
+            return msg, 200
+
+        ok = log_worklog(t, today, remaining)
+        if ok:
+            msg = (f"Topped up today:\n"
+                   f"  {today} {t} +{remaining/3600:.2f}h\n"
+                   f"  Was: {already/3600:.2f}h, now: {DAILY_SECONDS/3600:.1f}h")
         else:
-            msg = f"Today already full ({DAILY_SECONDS/3600:.1f}h). Nothing added."
+            msg = (f"FAILED to log {t} on {today}.\n"
+                   f"  Was: {already/3600:.2f}h, tried to add: {remaining/3600:.2f}h\n"
+                   f"  Check Render logs for details.")
         sms(msg)
         return msg, 200
     except Exception as e:
-        log.error(f"test/topup failed: {e}")
+        log.exception(f"test/topup failed: {e}")
         return f"Error: {e}", 500
 
 
