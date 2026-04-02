@@ -14,9 +14,15 @@ services:
         sync: false
       - key: TEMPO_API_TOKEN
         sync: false
+      - key: JIRA_DOMAIN
+        sync: false
+      - key: JIRA_EMAIL
+        sync: false
+      - key: JIRA_API_TOKEN
+        sync: false
       - key: JIRA_ACCOUNT_ID
         sync: false
-      - key: TICKETS
+      - key: JIRA_BOARD_ID
         sync: false
       - key: TEMPO_BASE_URL
         value: https://api.tempo.io

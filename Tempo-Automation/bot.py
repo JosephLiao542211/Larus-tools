@@ -211,19 +211,74 @@ def health():
     return "ok"
 
 
+@app.route("/test/sms")
+def test_sms():
+    """Health check that sends you an SMS."""
+    try:
+        tickets = get_active_tickets()
+        today = datetime.date.today().isoformat()
+        logged = get_logged_seconds(today)
+        sms(f"Tempo bot alive!\n"
+            f"Active tickets: {len(tickets)} ({', '.join(tickets[:5]) or 'none'})\n"
+            f"Today ({today}): {logged/3600:.1f}h / {DAILY_SECONDS/3600:.1f}h logged")
+        return "SMS sent", 200
+    except Exception as e:
+        log.error(f"test/sms failed: {e}")
+        return f"Error: {e}", 500
+
+
+@app.route("/test/topup")
+def test_topup():
+    """Top up today to 7.5h on a random active ticket (weekdays only)."""
+    try:
+        if datetime.date.today().weekday() >= 5:
+            msg = "It's the weekend — no hours logged."
+            sms(msg)
+            return msg, 200
+
+        tickets = get_active_tickets()
+        if not tickets:
+            sms("Top-up failed: no active tickets in sprint.")
+            return "No active tickets", 200
+
+        today = datetime.date.today().isoformat()
+        t = random.choice(tickets)
+        _, added = top_up(t, today, DAILY_SECONDS)
+
+        if added > 0:
+            msg = f"Topped up today:\n  {today} {t} +{added/3600:.1f}h"
+        else:
+            msg = f"Today already full ({DAILY_SECONDS/3600:.1f}h). Nothing added."
+        sms(msg)
+        return msg, 200
+    except Exception as e:
+        log.error(f"test/topup failed: {e}")
+        return f"Error: {e}", 500
+
+
+@app.route("/run/weekly")
+def run_weekly():
+    """Trigger the Monday weekly job on demand."""
+    try:
+        monday_job()
+        return "Weekly job done", 200
+    except Exception as e:
+        log.error(f"run/weekly failed: {e}")
+        return f"Error: {e}", 500
+
+
+@app.route("/run/monthend")
+def run_monthend():
+    """Trigger the month-end gap fill on demand."""
+    try:
+        month_end_job()
+        return "Month-end job done", 200
+    except Exception as e:
+        log.error(f"run/monthend failed: {e}")
+        return f"Error: {e}", 500
+
+
 if __name__ == "__main__":
-    scheduler = BackgroundScheduler()
-    hour = int(os.environ.get("PROMPT_HOUR", "9"))
-
-    # Every Monday at 9am
-    scheduler.add_job(monday_job, "cron", day_of_week="mon", hour=hour, minute=0,
-                      id="monday")
-    # Every day at 8am — checks if 7 days before month end
-    scheduler.add_job(month_end_job, "cron", hour=hour - 1, minute=0,
-                      id="month_end")
-
-    scheduler.start()
-    log.info("Scheduler started")
-
     port = int(os.environ.get("PORT", "10000"))
+    log.info("Server starting — use external cron to hit /run/weekly and /run/monthend")
     app.run(host="0.0.0.0", port=port)
