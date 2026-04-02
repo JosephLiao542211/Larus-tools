@@ -1,4 +1,5 @@
 import os, logging, random, datetime, calendar, requests, zoneinfo
+import holidays
 from flask import Flask
 from twilio.rest import Client
 
@@ -25,9 +26,14 @@ JIRA_BOARD_ID = os.environ["JIRA_BOARD_ID"]
 TZ = zoneinfo.ZoneInfo(os.environ.get("TZ", "America/Toronto"))
 
 twilio = Client(TWILIO_SID, TWILIO_AUTH)
+ca_holidays = holidays.Canada(prov="ON")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
+
+def is_workday(d: datetime.date) -> bool:
+    """True if d is a weekday and not a Canadian/Ontario holiday."""
+    return d.weekday() < 5 and d not in ca_holidays
 
 def sms(body: str):
     twilio.messages.create(body=body, from_=TWILIO_FROM, to=MY_PHONE)
@@ -91,12 +97,12 @@ def log_worklog(issue_id: str, issue_key: str, date: str, seconds: int) -> bool:
     return ok
 
 
-def weekdays(start: datetime.date, count: int) -> list[datetime.date]:
-    """Return `count` weekdays starting from `start`."""
+def workdays(start: datetime.date, count: int) -> list[datetime.date]:
+    """Return `count` workdays (weekdays excl. holidays) starting from `start`."""
     days = []
     d = start
     while len(days) < count:
-        if d.weekday() < 5:
+        if is_workday(d):
             days.append(d)
         d += datetime.timedelta(days=1)
     return days
@@ -174,7 +180,7 @@ def monday_job():
         return
 
     today = datetime.datetime.now(TZ).date()
-    days = weekdays(today, 5)  # Mon-Fri
+    days = workdays(today, 5)  # Mon-Fri
 
     variation = random.choice([variation_1, variation_2, variation_3])
     lines = variation(tickets, days)
@@ -201,7 +207,7 @@ def month_end_job():
     lines = ["Month-end gap fill:"]
     d = today
     while d <= end:
-        if d.weekday() < 5:
+        if is_workday(d):
             already = get_logged_seconds(d.isoformat())
             if already < DAILY_SECONDS:
                 t = random.choice(tickets)
@@ -234,7 +240,8 @@ code{background:#f0f0f0;padding:2px 6px;border-radius:3px;font-size:0.9em}
 <tr><th>Endpoint</th><th>Description</th></tr>
 <tr><td><a href="/health">/health</a></td><td>Ping check</td></tr>
 <tr><td><a href="/test/sms">/test/sms</a></td><td>Send status SMS (active tickets + today's hours)</td></tr>
-<tr><td><a href="/test/topup">/test/topup</a></td><td>Top up today to 7.5h on a random ticket (weekdays only)</td></tr>
+<tr><td><a href="/test/topup">/test/topup</a></td><td>Top up today to 7.5h on a random ticket (workdays only)</td></tr>
+<tr><td><a href="/test/holiday">/test/holiday</a></td><td>List all Ontario holidays (red days) for this year</td></tr>
 <tr><td><a href="/run/weekly">/run/weekly</a></td><td>Fill the week with a random variation (cron: Mon 9am)</td></tr>
 <tr><td><a href="/run/monthend">/run/monthend</a></td><td>Fill month-end gaps (cron: daily 8am, acts 7 days before EOM)</td></tr>
 </table>
@@ -287,8 +294,10 @@ def test_sms():
 def test_topup():
     """Top up today to 7.5h on a random active ticket (weekdays only)."""
     try:
-        if datetime.datetime.now(TZ).date().weekday() >= 5:
-            msg = "It's the weekend — no hours logged."
+        today_date = datetime.datetime.now(TZ).date()
+        if not is_workday(today_date):
+            reason = ca_holidays.get(today_date, "weekend")
+            msg = f"Not a workday ({reason}) — no hours logged."
             sms(msg)
             return msg, 200
 
@@ -326,6 +335,24 @@ def test_topup():
         return msg, 200
     except Exception as e:
         log.exception(f"test/topup failed: {e}")
+        return f"Error: {e}", 500
+
+
+@app.route("/test/holiday")
+def test_holiday():
+    """List all holidays (red days) for the current year."""
+    try:
+        today = datetime.datetime.now(TZ).date()
+        year = today.year
+        year_holidays = sorted(ca_holidays[datetime.date(year, 1, 1):datetime.date(year, 12, 31)])
+        lines = [f"Ontario holidays {year}:\n"]
+        for d in year_holidays:
+            past = " (past)" if d < today else ""
+            lines.append(f"  {d} {d.strftime('%a')} - {ca_holidays.get(d)}{past}")
+        msg = "\n".join(lines)
+        return msg, 200
+    except Exception as e:
+        log.exception(f"test/holiday failed: {e}")
         return f"Error: {e}", 500
 
 
