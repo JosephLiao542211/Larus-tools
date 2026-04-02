@@ -205,6 +205,31 @@ def month_end_job():
     sms("\n".join(lines))
 
 
+@app.route("/")
+def index():
+    return """<html><head><title>Larus Tools</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:600px;margin:40px auto;padding:0 20px;color:#333}
+h1{margin-bottom:4px}p.sub{color:#888;margin-top:0}
+table{width:100%;border-collapse:collapse;margin-top:20px}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid #eee}
+th{background:#f7f7f7}
+a{color:#0066cc;text-decoration:none}a:hover{text-decoration:underline}
+code{background:#f0f0f0;padding:2px 6px;border-radius:3px;font-size:0.9em}
+</style></head><body>
+<h1>Larus Tools</h1>
+<p class="sub">Tempo timesheet automation</p>
+<table>
+<tr><th>Endpoint</th><th>Description</th></tr>
+<tr><td><a href="/health">/health</a></td><td>Ping check</td></tr>
+<tr><td><a href="/test/sms">/test/sms</a></td><td>Send status SMS (active tickets + today's hours)</td></tr>
+<tr><td><a href="/test/topup">/test/topup</a></td><td>Top up today to 7.5h on a random ticket (weekdays only)</td></tr>
+<tr><td><a href="/run/weekly">/run/weekly</a></td><td>Fill the week with a random variation (cron: Mon 9am)</td></tr>
+<tr><td><a href="/run/monthend">/run/monthend</a></td><td>Fill month-end gaps (cron: daily 8am, acts 7 days before EOM)</td></tr>
+</table>
+</body></html>"""
+
+
 @app.route("/health")
 def health():
     return "ok"
