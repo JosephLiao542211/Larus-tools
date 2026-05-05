@@ -1,6 +1,6 @@
-import os, logging, random, datetime, calendar, requests, zoneinfo, functools
+import os, logging, random, datetime, calendar, requests, zoneinfo
 import holidays
-from flask import Flask, request as flask_request, Response
+from flask import Flask, request as flask_request
 from twilio.rest import Client
 
 logging.basicConfig(level=logging.INFO)
@@ -25,23 +25,9 @@ JIRA_API_TOKEN = os.environ["JIRA_API_TOKEN"]
 JIRA_BOARD_ID = os.environ["JIRA_BOARD_ID"]
 TZ = zoneinfo.ZoneInfo(os.environ.get("TZ", "America/Toronto"))
 
-AUTH_USER = os.environ["AUTH_USERNAME"]
-AUTH_PASS = os.environ["AUTH_PASSWORD"]
-
 twilio = Client(TWILIO_SID, TWILIO_AUTH)
 ca_holidays = holidays.Canada(prov="ON")  # statutory — blocks logging
 ca_optional = holidays.Canada(prov="ON", categories=("optional",))  # warnings only
-
-
-def require_auth(f):
-    @functools.wraps(f)
-    def decorated(*args, **kwargs):
-        auth = flask_request.authorization
-        if not auth or auth.username != AUTH_USER or auth.password != AUTH_PASS:
-            return Response("Unauthorized", 401,
-                            {"WWW-Authenticate": 'Basic realm="Login Required"'})
-        return f(*args, **kwargs)
-    return decorated
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -277,8 +263,79 @@ def month_end_job():
     sms("\n".join(lines))
 
 
+# ── Shared board ─────────────────────────────────────────────────────────
+
+_board: list[dict] = []  # [{name, text, ts}]
+MAX_MESSAGES = 50
+
+BOARD_STYLE = """
+<style>
+body{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 20px;color:#333}
+h1{margin-bottom:4px}p.sub{color:#888;margin-top:0}
+table{width:100%;border-collapse:collapse;margin-top:20px}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid #eee}
+th{background:#f7f7f7}
+a{color:#0066cc;text-decoration:none}a:hover{text-decoration:underline}
+.card{border:1px solid #eee;border-radius:6px;padding:10px 14px;margin:8px 0;background:#fafafa}
+.card .meta{font-size:0.8em;color:#999;margin-bottom:4px}
+.card .body{white-space:pre-wrap;word-break:break-word}
+form{margin-top:16px;display:flex;flex-direction:column;gap:8px}
+input,textarea{padding:8px;border:1px solid #ccc;border-radius:4px;font-size:1em;font-family:inherit}
+textarea{resize:vertical;min-height:80px}
+button{padding:8px 18px;background:#0066cc;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:1em;align-self:flex-start}
+button:hover{background:#0052a3}
+.empty{color:#aaa;margin-top:16px}
+.clear-btn{background:#e55;font-size:0.85em;padding:6px 12px;margin-left:8px}
+.clear-btn:hover{background:#c33}
+</style>
+"""
+
+
+@app.route("/board", methods=["GET", "POST"])
+def board():
+    if flask_request.method == "POST":
+        name = flask_request.form.get("name", "").strip() or "Anonymous"
+        text = flask_request.form.get("text", "").strip()
+        if text:
+            ts = datetime.datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
+            _board.append({"name": name, "text": text, "ts": ts})
+            if len(_board) > MAX_MESSAGES:
+                _board.pop(0)
+        from flask import redirect, url_for
+        return redirect(url_for("board"))
+
+    msgs = "".join(
+        f'<div class="card"><div class="meta"><b>{m["name"]}</b> · {m["ts"]}</div>'
+        f'<div class="body">{m["text"]}</div></div>'
+        for m in reversed(_board)
+    ) or '<p class="empty">No messages yet.</p>'
+
+    return f"""<html><head><title>Board</title>{BOARD_STYLE}</head><body>
+<h1>Board</h1>
+<p class="sub">Shared messages — cleared on server restart &nbsp;
+  <a href="/"><small>← back</small></a>
+  <form method="post" action="/board/clear" style="display:inline">
+    <button class="clear-btn" onclick="return confirm('Clear all messages?')">Clear all</button>
+  </form>
+</p>
+<form method="post">
+  <input name="name" placeholder="Your name (optional)" maxlength="40">
+  <textarea name="text" placeholder="Message..." maxlength="1000" required></textarea>
+  <button type="submit">Post</button>
+</form>
+<hr style="margin:20px 0;border:none;border-top:1px solid #eee">
+{msgs}
+</body></html>"""
+
+
+@app.route("/board/clear", methods=["POST"])
+def board_clear():
+    _board.clear()
+    from flask import redirect, url_for
+    return redirect(url_for("board"))
+
+
 @app.route("/")
-@require_auth
 def index():
     return """<html><head><title>Larus Tools</title>
 <style>
@@ -295,6 +352,7 @@ code{background:#f0f0f0;padding:2px 6px;border-radius:3px;font-size:0.9em}
 <table>
 <tr><th>Endpoint</th><th>Description</th></tr>
 <tr><td><a href="/health">/health</a></td><td>Ping check</td></tr>
+<tr><td><a href="/board">/board</a></td><td>Shared message board</td></tr>
 <tr><td><a href="/test/sms">/test/sms</a></td><td>Send status SMS (active tickets + today's hours)</td></tr>
 <tr><td><a href="/test/topup">/test/topup</a></td><td>Top up today to 7.5h on a random ticket (workdays only)</td></tr>
 <tr><td><a href="/test/holiday">/test/holiday</a></td><td>List Ontario statutory holidays for this year</td></tr>
@@ -310,7 +368,6 @@ def health():
 
 
 @app.route("/test/sms")
-@require_auth
 def test_sms():
     """Health check that sends you an SMS with debug info."""
     try:
@@ -348,7 +405,6 @@ def test_sms():
 
 
 @app.route("/test/topup")
-@require_auth
 def test_topup():
     """Top up today to 7.5h on a random active ticket (weekdays only)."""
     try:
@@ -398,7 +454,6 @@ def test_topup():
 
 
 @app.route("/test/holiday")
-@require_auth
 def test_holiday():
     """List all Ontario holidays for the current year."""
     try:
@@ -425,7 +480,6 @@ def test_holiday():
 
 
 @app.route("/run/weekly")
-@require_auth
 def run_weekly():
     """Trigger the Monday weekly job on demand."""
     try:
@@ -437,7 +491,6 @@ def run_weekly():
 
 
 @app.route("/run/monthend")
-@require_auth
 def run_monthend():
     """Trigger the month-end gap fill on demand."""
     try:
